@@ -1,0 +1,7 @@
+"0",""
+"0","# 1. Compare AIC"
+"0","aic_vals <- data.frame("
+"0","  Model = c(""ARIMA"", ""ETS""),"
+"0","  AIC   = c(AIC(arima_model), AIC(ets_model))"
+"0",")"
+"0","print(aic_vals)"

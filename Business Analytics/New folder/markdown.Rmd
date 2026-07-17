@@ -1,0 +1,618 @@
+---
+title: "Untitled"
+author: "Victor Ene"
+date: "2025-05-04"
+output: html_document
+---
+
+```{r}
+install.packages("lmtest")
+install.packages("readxl")
+install.packages("mFilter")
+install.packages("vars")
+install.packages("dlm")
+```
+
+```{r}
+library(forecast)
+library(tseries)
+library(zoo)
+library(tsibble)
+library(feasts)
+library(lubridate)
+library(e1071)
+library(randomForest)
+library(caret)
+library(keras)
+library(tensorflow)
+library(ggplot2)
+library(Metrics)
+library(dplyr)
+library(tidyr)
+library(lmtest)
+library(readxl)
+library(readr)
+library(mFilter)
+library(dlm)
+library(vars)
+```
+
+#Preprocessing
+
+```{r}
+# Read the data, skipping the first 5 rows
+fuel0 <- read_excel(
+  path      = "fuel_price.xlsx",
+  sheet     = "Table 1 Weekly",
+  skip      = 5,
+  col_names = TRUE
+)
+
+# Convert types ensure variables are in the correct type
+fuel <- fuel0 |>
+  rename(
+    week_ending                = "Week ending",
+    avg_fuel_price             = "Average fuel price",
+    quantity_per_transaction   = "Estimated  quantity demand per transaction",
+    avg_rd_sales               = "Average road fuel sales"
+  ) |>
+  mutate(
+    week_ending                = as.Date(week_ending),
+    avg_fuel_price             = as.numeric(avg_fuel_price),
+    quantity_per_transaction   = as.numeric(quantity_per_transaction),
+    avg_rd_sales               = as.numeric(avg_rd_sales)
+  )
+
+str(fuel)
+```
+
+```{r}
+# Check for missing values
+fuel |> summarise_all(~ sum(is.na(.)))
+
+# Impute missing values via linear interpolation 
+fuel <- fuel |>
+  arrange(week_ending) |>
+  mutate(
+    # Linear interpolation for interior NAs
+    avg_fuel_price            = na.approx(avg_fuel_price,            na.rm = FALSE),
+    quantity_per_transaction  = na.approx(quantity_per_transaction,  na.rm = FALSE),
+    avg_rd_sales              = na.approx(avg_rd_sales,              na.rm = FALSE)
+  )
+
+# Impute missing values via forward fill
+fuel <- fuel |>
+  arrange(week_ending) |>
+  mutate(
+    avg_rd_sales             = na.locf(avg_rd_sales,             na.rm = FALSE)
+  )
+
+fuel |> summarise_all(~ sum(is.na(.)))
+```
+
+#Outlier Detection
+
+```{r}
+
+# Visualize outliers using a boxplot
+ggplot(fuel, aes(x = week_ending, y = avg_fuel_price)) +
+  geom_boxplot(outlier.colour = "red", outlier.size = 3) + 
+  labs(title = "Boxplot of Fuel Price highlighting outliers", x = "Week Ending", y = "Fuel Price") +
+  theme_minimal()
+
+# Calculate IQR values
+iqr_vals <- IQR(fuel$avg_fuel_price, na.rm = TRUE)
+q1       <- quantile(fuel$avg_fuel_price, 0.25, na.rm = TRUE)
+q3       <- quantile(fuel$avg_fuel_price, 0.75, na.rm = TRUE)
+lower_f  <- q1 - 1.5 * iqr_vals
+upper_f  <- q3 + 1.5 * iqr_vals
+
+# Identify outlier indices
+out_idx <- which(fuel$avg_fuel_price < lower_f | fuel$avg_fuel_price > upper_f)
+
+# Visualise IQR-based outliers on the interpolated series
+ggplot(fuel, aes(week_ending, avg_fuel_price)) +
+  geom_line() +
+  geom_point(data = fuel[out_idx, ], aes(week_ending, avg_fuel_price), colour = "red") +
+  labs(title = "Fuel Price with IQR-Based Outliers Highlighted")
+
+# replace the outliers with NA and apply linear interpolation
+fuel$avg_fuel_price[out_idx] <- NA  
+fuel$avg_fuel_price <- zoo::na.approx(fuel$avg_fuel_price, na.rm = FALSE)
+
+
+```
+
+##Duplicate values
+
+```{r}
+# Find duplicates
+duplicates <- fuel |>
+  group_by(week_ending) |>
+  filter(n() > 1)
+
+print(duplicates)
+
+fuel <- fuel |>
+  group_by(week_ending) |>
+  summarise(
+    avg_fuel_price           = mean(avg_fuel_price, na.rm = TRUE),
+    avg_rd_sales             = mean(avg_rd_sales, na.rm = TRUE)
+  ) |>
+  ungroup()
+
+# Check again for duplicates after aggregation 
+duplicates_after <- fuel |>
+  group_by(week_ending) |>
+  filter(n() > 1)
+
+print(duplicates_after)
+
+```
+
+```{r}
+# Convert cleaned data to ts
+fuel_ts <- ts(fuel$avg_fuel_price, frequency = 52, start = c(2021, 4))
+ 
+
+#visualise the time series
+autoplot(fuel_ts) +
+  labs(
+    title = "Cleaned Weekly Average Fuel Price",
+    x     = "Week Ending",
+    y     = "Price (pence per litre)"
+  ) +
+  theme_minimal()
+
+```
+
+## Decomposition
+
+```{r}
+# STL decomposition
+d_compose <- stl(fuel_ts, s.window = "periodic")
+autoplot(d_compose) +
+  labs(
+    title = "STL Decomposition",
+    x     = "Weeks"
+  ) +
+  theme_minimal()
+
+# Hodrick–Prescott filter decomposition
+hp <- hpfilter(fuel_ts, type = "lambda", freq = 129600)
+autoplot(fuel_ts, series = "Cleaned") +
+  autolayer(hp$trend, series = "HP Trend") +
+  autolayer(hp$cycle, series = "HP Cycle") +
+  labs(
+    title = "HP Filter Decomposition",
+    x     = "Week"
+  ) +
+  theme_minimal()
+
+```
+
+## Stationarity
+
+```{r}
+adf.test(fuel_ts)
+
+fuel_ts_diff <- diff(fuel_ts)
+adf.test(fuel_ts_diff)
+
+```
+
+## acf / pacf plots
+
+```{r}
+#par(mfrow = c(1,2))
+acf(fuel_ts_diff)
+pacf(fuel_ts_diff)
+```
+
+## Train/Test Split
+
+```{r}
+# Total length of the fuel time series
+n <- length(fuel_ts_diff)
+
+# Split target variable (avg_fuel_price)
+train <- window(fuel_ts_diff, end = time(fuel_ts_diff)[floor(0.8 * n)])
+test <- window(fuel_ts_diff, start = time(fuel_ts_diff)[floor(0.8 * n) + 1])
+
+```
+
+## Models
+
+```{r}
+# Apply SARIMA using auto.arima() function
+sarima_model <- auto.arima(train, seasonal = TRUE)
+
+# Forecast using the SARIMA model
+sarima_forecast <- forecast(sarima_model, h = length(test))
+
+# Plot the forecast
+plot(sarima_forecast)
+```
+
+```{r}
+# Create comparison data frame
+sarima_df <- data.frame(
+  Week = 1:length(test),
+  Actual = as.numeric(test),
+  Predicted = as.numeric(sarima_forecast$mean)
+)
+
+ggplot(sarima_df, aes(x = Week)) +
+  geom_line(aes(y = Actual, colour = "Actual")) +
+  geom_line(aes(y = Predicted, colour = "Predicted")) +
+  labs(
+    title = "SARIMA: Actual vs Predicted Fuel Prices",
+    x = "Test Week",
+    y = "Differenced Fuel Price"
+  ) +
+  scale_colour_manual(values = c("Actual" = "black", "Predicted" = "red")) +
+  theme_minimal()
+
+```
+
+### Holt-Winters Model
+
+```{r}
+hw_model <- HoltWinters(train)
+hw_forecast <- forecast(hw_model, h = length(test))
+plot(hw_forecast)
+```
+
+### STLF
+
+```{r}
+stlf_model <- stlf(train, h = length(test))
+stlf_forecast <- stlf_model
+plot(stlf_forecast)
+
+```
+
+##Multivariate analysis
+
+```{r}
+# Load the external data (oil prices)
+external_data <- read_csv("DCOILBRENTEU.csv")
+
+external_data <- external_data |>
+  mutate(observation_date = as.Date(observation_date, format = "%Y-%m-%d"))
+
+sum(is.na(external_data$DCOILBRENTEU)) 
+
+# Handle missing values
+external_data <- external_data |>
+  mutate(DCOILBRENTEU = na.approx(DCOILBRENTEU, na.rm = FALSE))
+
+sum(is.na(external_data$DCOILBRENTEU))
+
+
+# Standardise week alignment: set both datasets to the same weekday 
+fuel <- fuel |>
+  mutate(week_ending = floor_date(week_ending, unit = "week", week_start = 5))
+
+external_weekly <- external_data |>
+  mutate(week_ending = floor_date(observation_date, unit = "week", week_start = 5)) |>
+  group_by(week_ending) |>
+  summarise(Oil_Price = mean(DCOILBRENTEU, na.rm = TRUE))
+
+# Merge
+merged_data <- left_join(fuel, external_weekly, by = "week_ending")
+
+head(merged_data)
+```
+
+```{r}
+# Convert merged data to a time series object
+merged_ts <- ts(merged_data[, c("avg_fuel_price", "avg_rd_sales", "Oil_Price")], frequency = 52, start = c(2021, 4))  # Weekly data, starting from week 4 of 2021
+
+# Check the structure of the new time series object
+str(merged_ts)
+sum(is.na(merged_ts))
+
+# Apply ADF test for stationarity check
+adf.test(merged_ts[, "avg_fuel_price"]) 
+adf.test(merged_ts[, "avg_rd_sales"])
+adf.test(merged_ts[, "Oil_Price"])
+
+# Convert the time series object to a data frame
+merged_ts_df <- data.frame(merged_ts)
+
+# Apply differencing to avg_fuel_price and Oil_Price (but not avg_rd_sales)
+# Add NA for the first value to maintain consistency with the original length
+merged_ts_diff <- merged_ts_df %>%
+  mutate(
+    avg_fuel_price = c(NA, diff(avg_fuel_price, differences = 1)),  # Add NA for the first value
+    Oil_Price  = c(NA, diff(Oil_Price, differences = 1))         # Add NA for the first value
+  ) %>%
+  drop_na()  # Remove NA values generated by differencing
+
+# Convert the resulting data back into a time series object
+merged_ts_diff <- ts(merged_ts_diff[, c("avg_fuel_price", "avg_rd_sales", "Oil_Price")], frequency = 52, start = c(2021, 4))
+
+# Check the structure of the new time series object
+str(merged_ts_diff)
+sum(is.na(merged_ts_diff))
+
+```
+
+## Granger casuality
+
+```{r}
+# Create differenced data for Granger causality test
+granger_df <- as.data.frame(merged_ts_diff) %>%
+  dplyr::select(avg_fuel_price, Oil_Price) %>%
+  drop_na()  
+
+# Granger causality test
+granger_test_oil_to_fuel <- grangertest(granger_df$avg_fuel_price ~ granger_df$Oil_Price, order = 2)
+print(granger_test_oil_to_fuel)
+
+```
+
+```{r}
+n <- nrow(merged_ts_diff)
+split <- floor(0.8 * n)
+
+train_ts <- merged_ts_diff[1:split, ]
+test_ts  <- merged_ts_diff[(split + 1):n, ]
+```
+
+```{r}
+# SARIMAX 
+sarimax_model <- auto.arima(train_ts[, "avg_fuel_price"], xreg = train_ts[, "Oil_Price"])
+sarimax_forecast <- forecast(sarimax_model, xreg = test_ts[, "Oil_Price"])
+sarimax_pred <- sarimax_forecast$mean
+
+```
+
+```{r}
+# Fit SARIMAX model with both oil prices and sales volume as exogenous variables
+sarimax_with_sales <- auto.arima(train_ts[, "avg_fuel_price"], xreg = train_ts[, c("avg_rd_sales", "Oil_Price")], seasonal = TRUE)
+sarimax_with_sales_forecast <- forecast(sarimax_with_sales, xreg = test_ts[, c("avg_rd_sales", "Oil_Price")])
+
+# Fit SARIMAX model with only oil prices as the exogenous variable
+sarimax_no_sales <- auto.arima(train_ts[, "avg_fuel_price"], xreg = train_ts[, "Oil_Price", drop = FALSE], seasonal = TRUE)
+sarimax_no_sales_forecast <- forecast(sarimax_no_sales, xreg = test_ts[, "Oil_Price", drop = FALSE])
+
+actual_f <- test_ts[, "avg_fuel_price"]
+rmse_sarimax_with_sales <- rmse(actual_f, sarimax_with_sales_forecast$mean[1:length(actual_f)])
+rmse_sarimax_no_sales <- rmse(actual_f, sarimax_no_sales_forecast$mean[1:length(actual_f)])
+
+compare_sales_df <- data.frame(
+  Model = c("With Sales Volume", "Without Sales Volume"),
+  RMSE = c(rmse_sarimax_with_sales, rmse_sarimax_no_sales)
+)
+print(compare_sales_df)
+
+```
+
+```{r}
+build_dlm <- function(par) {
+  dlmModPoly(order = 1, dV = exp(par[1]), dW = exp(par[2]))
+}
+
+dlm_fit <- dlmMLE(train_ts[, "avg_fuel_price"], parm = c(1, 1), build = build_dlm)
+model_dlm <- build_dlm(dlm_fit$par)
+dlm_forecast <- dlmForecast(model_dlm, nAhead = nrow(test_ts))
+dlm_pred <- sapply(dlm_forecast$a, function(x) x[1])
+
+```
+
+```{r}
+VARselect(train_ts, lag.max = 10, type = "const")  # choose best lag
+model_var <- VAR(train_ts, p = 3)  
+var_forecast <- predict(model_var, n.ahead = nrow(test_ts))
+var_pred <- var_forecast$fcst$avg_fuel_price[, "fcst"]  
+
+```
+
+```{r}
+# Convert merged_ts_diff to a data frame
+merged_ts_diff_df <- data.frame(merged_ts_diff)
+
+# Apply lag and create new variables (lag1, lag2, oil_lag1)
+svr_df <- merged_ts_diff_df %>%
+  mutate(
+    lag1 = lag(avg_fuel_price, 1),      # Lag of avg_fuel_price by 1
+    lag2 = lag(avg_fuel_price, 2),      # Lag of avg_fuel_price by 2
+    oil_lag1 = lag(Oil_Price, 1)        # Lag of Oil_Price by 1
+  ) %>%
+  drop_na()  # Drop NA values generated by lagging
+
+head(svr_df)
+
+train_svr <- svr_df[1:floor(0.8 * nrow(svr_df)), ]
+test_svr <- svr_df[(floor(0.8 * nrow(svr_df)) + 1):nrow(svr_df), ]
+
+# Train the SVR model with lagged fuel price and oil price as exogenous variables
+svr_model <- svm(avg_fuel_price ~ lag1 + lag2 + oil_lag1, data = train_svr)
+svr_pred <- predict(svr_model, newdata = test_svr)
+
+```
+
+```{r}
+# Random Forest
+rf_model <- randomForest(avg_fuel_price ~ lag1 + lag2 + oil_lag1, data = train_svr)
+rf_pred <- predict(rf_model, newdata = test_svr)
+
+
+```
+
+##model evaluation
+
+```{r}
+
+actual_univariate   <- as.numeric(test)
+actual_multivariate <- test_ts[, "avg_fuel_price"]
+actual_svr_rf       <- test_svr$avg_fuel_price
+
+# Slice predictions
+sarima_pred    <- sarima_forecast$mean[1:length(actual_univariate)]
+hw_pred        <- hw_forecast$mean[1:length(actual_univariate)]
+stlf_pred      <- stlf_forecast$mean[1:length(actual_univariate)]
+var_pred       <- var_pred[1:length(actual_multivariate)]
+dlm_pred       <- dlm_pred[1:length(actual_multivariate)]
+sarimax_pred   <- sarimax_pred[1:length(actual_multivariate)]
+svr_pred       <- svr_pred[1:length(actual_svr_rf)]
+rf_pred        <- rf_pred[1:length(actual_svr_rf)]
+
+# RMSE
+rmse_values <- c(
+  rmse(actual_univariate, sarima_pred),
+  rmse(actual_univariate, hw_pred),
+  rmse(actual_univariate, stlf_pred),
+  rmse(actual_multivariate, var_pred),
+  rmse(actual_multivariate, dlm_pred),
+  rmse(actual_multivariate, sarimax_pred),
+  rmse(actual_svr_rf, svr_pred),
+  rmse(actual_svr_rf, rf_pred)
+)
+# MAE
+mae_values <- c(
+  mae(actual_univariate, sarima_pred),
+  mae(actual_univariate, hw_pred),
+  mae(actual_univariate, stlf_pred),
+  mae(actual_multivariate, var_pred),
+  mae(actual_multivariate, dlm_pred),
+  mae(actual_multivariate, sarimax_pred),
+  mae(actual_svr_rf, svr_pred),
+  mae(actual_svr_rf, rf_pred)
+)
+
+model_names <- c("SARIMA", "Holt-Winters", "STLF",
+                 "VAR", "DLM", "SARIMAX", "SVR", "Random Forest")
+
+accuracy_df <- data.frame(
+  Model = model_names,
+  RMSE  = round(rmse_values, 4),
+  MAE   = round(mae_values, 4)
+)
+
+accuracy_df
+# --- Step 2: Visualise Accuracy (Bar Plot by RMSE) ---
+ggplot(accuracy_df, aes(x = reorder(Model, RMSE), y = RMSE)) +
+  geom_bar(stat = "identity", fill = "lightblue") +
+  coord_flip() +
+  labs(
+    title = "Model Comparison by RMSE",
+    x = "Model",
+    y = "Root Mean Squared Error"
+  ) +
+  geom_text(aes(label = round(RMSE, 2)), hjust = -0.2, size = 3.5) +
+  theme_minimal()
+
+```
+
+```{r}
+# Step 3: Actual vs Predicted for SVR
+svr_df_plot <- data.frame(
+  Week = 1:length(actual_svr_rf),
+  Actual = actual_svr_rf,
+  Predicted = svr_pred
+)
+
+ggplot(svr_df_plot, aes(x = Week)) +
+  geom_line(aes(y = Actual, colour = "Actual")) +
+  geom_line(aes(y = Predicted, colour = "Predicted")) +
+  labs(
+    title = "SVR: Actual vs Predicted Fuel Prices",
+    x = "Test Week",
+    y = "Differenced Fuel Price"
+  ) +
+  scale_colour_manual(values = c("Actual" = "black", "Predicted" = "red")) +
+  theme_minimal()
+
+```
+
+## forecasting using best mode;
+
+```{r}
+# Load the merged data 
+# Prepare features: lagging `avg_fuel_price` and `Oil_Price`
+svr_df <- merged_data %>%
+  mutate(
+    lag1 = lag(avg_fuel_price, 1),
+    lag2 = lag(avg_fuel_price, 2),
+    oil_lag1 = lag(Oil_Price, 1)
+  ) %>%
+  drop_na() 
+
+# Train SVR model using the entire dataset
+svr_model <- svm(avg_fuel_price ~ lag1 + lag2 + oil_lag1, data = svr_df)
+
+# Forecast the next 24 weeks using recursive prediction
+# Start with the last available input row (for recursive prediction)
+last_row <- tail(svr_df, 1)
+
+# Pre-allocate a vector for the 24-week forecast
+svr_forecast_24 <- numeric(24)
+
+# Perform the recursive forecast for 24 weeks ahead
+for (i in 1:24) {
+  new_input <- data.frame(
+    lag1 = last_row$lag1,
+    lag2 = last_row$lag2,
+    oil_lag1 = last_row$oil_lag1
+  )
+  
+  # Predict the next value
+  pred_next <- predict(svr_model, new_input)
+  svr_forecast_24[i] <- pred_next
+  
+  # Update lags for the next prediction
+  last_row$lag2 <- last_row$lag1
+  last_row$lag1 <- pred_next
+  last_row$oil_lag1 <- last_row$oil_lag1 # Optionally update oil prices if forecasts available
+}
+
+# Time index for the next 24 weeks
+start_week <- max(merged_data$week_ending, na.rm = TRUE) + 7  # Start from the next week
+future_weeks <- seq.Date(from = start_week, by = "week", length.out = 24)
+
+# Combine the forecasted values with the corresponding weeks
+svr_forecast_df <- data.frame(
+  Week_Ending = future_weeks,
+  Forecasted_Fuel_Price = svr_forecast_24
+)
+
+# Print forecasted values
+print(svr_forecast_df)
+
+```
+
+```{r}
+# Combine historical and forecasted data for visualization
+historical_data <- data.frame(
+  Week_Ending = merged_data$week_ending,
+  Fuel_Price = merged_data$avg_fuel_price
+)
+
+# Combine historical data and forecasted data
+forecasted_data <- data.frame(
+  Week_Ending = future_weeks,
+  Fuel_Price = svr_forecast_24
+)
+
+# Combine historical and forecasted data into a single data frame
+combined_data <- bind_rows(
+  historical_data %>% mutate(Type = "Historical"),
+  forecasted_data %>% mutate(Type = "Forecasted")
+)
+
+# Visualize both historical and forecasted data
+ggplot(combined_data, aes(x = Week_Ending, y = Fuel_Price, colour = Type)) +
+  geom_line(size = 1) +
+  labs(
+    title = "SVR Forecast vs Historical Fuel Prices",
+    x = "Week Ending",
+    y = "Fuel Price",
+    colour = "Data Type"
+  ) +
+  scale_colour_manual(values = c("black", "darkgreen")) +
+  theme_minimal()
+
+```

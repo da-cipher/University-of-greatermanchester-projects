@@ -1,0 +1,58 @@
+# Load required libraries
+library(tidyverse)
+library(forecast)
+library(ggplot2)
+
+# Load dataset
+seafood_data <- read.csv("UKSeafoodSupplyChain.csv")
+
+# Data Preparation and Cleaning
+seafood_data_clean <- seafood_data %>%
+  filter(!is.na(Volume)) %>% # Remove missing values in Volume
+  mutate(Volume_kg = Volume / 1000) %>% # Convert grams to kilograms
+  select(-Volume, -Units, -Flag, -FlagDescription) # Remove unnecessary columns
+
+# Verify data preparation
+head(seafood_data_clean)
+
+# Descriptive Statistics
+summary_stats <- seafood_data_clean %>%
+  group_by(Commodity, SpeciesType) %>%
+  summarise(Mean_Volume = mean(Volume_kg), 
+            Median_Volume = median(Volume_kg),
+            SD_Volume = sd(Volume_kg),
+            Count = n())
+
+print(summary_stats)
+
+# Exploratory Data Analysis (EDA)
+ggplot(seafood_data_clean, aes(x=CalendarYear, y=Volume_kg, color=Commodity)) +
+  geom_line(stat='summary', fun='sum') +
+  labs(title="Annual Seafood Trade Volumes (kg)", x="Year", y="Total Volume (kg)") +
+  theme_minimal()
+
+# Correlation Analysis (Total annual imports vs. exports)
+annual_data <- seafood_data_clean %>%
+  group_by(CalendarYear, Commodity) %>%
+  summarise(Total_Volume = sum(Volume_kg)) %>%
+  pivot_wider(names_from = Commodity, values_from = Total_Volume)
+
+cor_test_result <- cor.test(annual_data$Imports, annual_data$Exports)
+print(cor_test_result)
+
+# Scatter plot for correlation
+ggplot(annual_data, aes(x=Imports, y=Exports)) +
+  geom_point() +
+  geom_smooth(method='lm') +
+  labs(title="Correlation between Imports and Exports", x="Imports (kg)", y="Exports (kg)") +
+  theme_minimal()
+
+# Time-Series Analysis and Forecasting (Exports as example)
+export_ts <- ts(annual_data$Exports, start=min(annual_data$CalendarYear), frequency=1)
+model_arima <- auto.arima(export_ts)
+forecast_arima <- forecast(model_arima, h=5)
+
+# Plot forecast
+autoplot(forecast_arima) +
+  labs(title="5-Year Forecast of Seafood Exports (kg)", x="Year", y="Exports (kg)") +
+  theme_minimal()

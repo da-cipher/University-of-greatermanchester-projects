@@ -1,0 +1,528 @@
+---
+title: "Data Visualisation"
+author: "Victor Ene"
+date: "2025-04-20"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+```
+
+```{r}
+install.packages("ggbump")
+install.packages("patchwork")
+install.packages("ggpmisc")
+# Load libraries
+library(tidyverse)
+library(forecast)
+library(ggplot2)
+library(dplyr)
+library(ggbump)
+library(broom)      
+library(patchwork)
+library(tidyverse)
+library(ggpmisc)   
+```
+
+# Getting and understanding the Data
+
+```{r}
+getwd()
+
+# Load dataset
+seafood_data <- read.csv("UKSeafoodSupplyChain.csv")
+
+# Summarise the dataset 
+summary(seafood_data)
+
+sum(is.na(seafood_data))
+
+# Count NA's in each column
+na_per_col <- colSums(is.na(seafood_data))
+print(na_per_col)
+```
+
+# Data Preparation and Cleaning
+
+```{r}
+# Identify rows with missing values in any column
+missing_rows <- seafood_data[rowSums(is.na(seafood_data)) > 0, ]
+
+# View the rows with missing values
+print(missing_rows)
+```
+
+```{r}
+# Impute missing production volumes 
+seafood_filled <- seafood_data |> 
+  group_by(Species, Commodity) |>                     
+  mutate(
+    Volume = ifelse(                                   
+      is.na(Volume) & Commodity == "Production",       
+      mean(Volume, na.rm = TRUE),                     
+      Volume                                           
+    )
+  ) |> 
+  ungroup() 
+
+sum(is.na(seafood_filled))
+
+```
+
+```{r}
+#Remove unnecessary columns, convert to tonnes and drop Purchases and Consumption
+cleanseafood_data <- seafood_filled |> select(-TemporalResolution, -Flag, -FlagDescription, -DataSupplier, -DataSet, -Units, -SpeciesType, -SACN) 
+
+cleanseafood_data <- cleanseafood_data |>
+  mutate(Volume_tonne = Volume / 1e6) |>    #grams to tonnes
+  select(-Volume) |>
+  filter(!Commodity %in% c("Purchases", "Consumption"))
+
+head(cleanseafood_data)
+```
+
+```{r}
+# Check for duplicate rows
+duplicates <- seafood_filled[duplicated(seafood_filled), ]
+
+print(duplicates)
+```
+
+
+# Exploratory Data Analysis (EDA)
+
+```{r}
+summary_stats <- cleanseafood_data |>
+  group_by(CalendarYear, Commodity) |>
+  summarise(Mean_Volume = mean(Volume_tonne), 
+            Median_Volume = median(Volume_tonne),
+            SD_Volume = sd(Volume_tonne),
+            Count = n(),
+            .groups = "drop")
+
+print(summary_stats)
+
+ggplot(summary_stats, aes(x = CalendarYear, y = Mean_Volume, color = Commodity)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2) +
+  labs(title = "Mean Seafood Volume by Year and Commodity",
+       x = "Year", y = "Mean Volume (tonnes)",
+       color = "Commodity") +
+  theme_minimal() +
+  theme(legend.position = "right")
+```
+
+```{r}
+# Summarise all trade volumes by Commodity and Year
+all_trade <- cleanseafood_data |>
+  group_by(Commodity, CalendarYear) |>  # Grouping by Commodity and Calendar Year
+  summarise(Total_Volume = sum(Volume_tonne, na.rm = TRUE), .groups = "drop") 
+
+print(all_trade)
+
+# Keep only Imports & Exports, then aggregate by year
+trade_IE <- cleanseafood_data %>% 
+  filter(Commodity %in% c("Imports", "Exports")) %>% 
+  group_by(CalendarYear, Commodity) %>% 
+  summarise(Total_Volume = sum(Volume_tonne, na.rm = TRUE), .groups = "drop")
+
+print(trade_IE)
+
+ggplot(trade_IE,
+       aes(x = factor(CalendarYear),
+           y = Total_Volume,     
+           fill = Commodity)) +
+  geom_col(position = "dodge") +
+  scale_y_continuous(labels = comma) +
+  labs(title = "UK Seafood Imports vs Exports by Year",
+       x = "Calendar year",
+       y = "Total volume",
+       fill = "Commodity") +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "right")  
+
+```
+
+## Which species dominate the UK seafood exports and imports
+```{r}
+# Summarise total export and import volumes by species
+species_trade <- cleanseafood_data |>
+  group_by(Species, Commodity) |>
+  summarise(Total_Volume = sum(Volume_tonne, na.rm = TRUE), .groups = "drop") 
+
+print(species_trade)
+
+
+# Identify dominant species for imports and exports
+dominant_exports <- species_trade |>
+  filter(Commodity == "Exports") |>
+  arrange(desc(Total_Volume)) |>
+  head(10) 
+
+print(dominant_exports)
+
+dominant_imports <- species_trade |>
+  filter(Commodity == "Imports") |>
+  arrange(desc(Total_Volume)) |>
+  head(10) 
+
+print(dominant_imports)
+
+
+# Top 10 Imports bar-plot
+p_imports <- ggplot(dominant_imports, aes(x = reorder(Species, Total_Volume), y = Total_Volume)) +
+  geom_col(fill = "#4b9cd3") +
+  coord_flip() +
+  labs(title = "Imports (2009–2020)",
+       x = NULL,
+       y = "Total Volume (tonnes)") +
+  theme_minimal(base_size = 12)
+
+# Top 10 Exports bar-plot
+p_exports <- ggplot(dominant_exports, aes(x = reorder(Species, Total_Volume), y = Total_Volume)) +
+  geom_col(fill = "#d95f02") +
+  coord_flip() +
+  labs(title = "Exports (2009–2020)",
+       x = NULL,
+       y = "Total Volume (tonnes)") +
+  theme_minimal(base_size = 12)
+
+# Display side by side
+p_imports + p_exports + 
+  plot_annotation(
+    title = "Dominant Seafood Species",
+    theme = theme(plot.title = element_text(size = 14, face = "bold"))
+  )
+```
+
+
+```{r}
+#top 10 species by Production
+dominant_production <- species_trade |>
+  filter(Commodity == "Production") |>
+  arrange(desc(Total_Volume)) |>
+  slice_head(n = 10)
+
+ggplot(dominant_production, aes(
+    x = reorder(Species, Total_Volume),
+    y = Total_Volume
+  )) +
+  geom_col(fill = "#4b9cd3", width = 0.7) +
+  coord_flip() +
+  labs(
+    title = "Top 10 Seafood Species by Production (2009–2020)",
+    x = NULL,
+    y = "Total Production Volume (tonnes)"
+  ) +
+  theme_minimal(base_size = 12)
+
+```
+
+### Yearly top 5 species 
+```{r}
+species_year <- cleanseafood_data |>
+  filter(Commodity %in% c("Imports", "Exports")) |>
+  group_by(CalendarYear, Commodity, Species) |>
+  summarise(Total_tonnes = sum(Volume_tonne, na.rm = TRUE),
+            .groups = "drop") |>
+  group_by(CalendarYear, Commodity) |>
+  mutate(Rank = rank(-Total_tonnes, ties.method = "min")) |>
+  ungroup()
+
+#top five in every year
+species_year_top <- species_year |>
+  filter(Rank <= 5)
+
+ggplot(species_year_top,
+       aes(x = CalendarYear,
+           y = Rank,
+           colour = Species)) +
+  geom_bump(size = 1) +
+  geom_point(size = 2) +
+  scale_y_reverse(breaks = 1:5) +                   # 1 = top
+  facet_wrap(~ Commodity) +
+  labs(title   = "Rank of Top-5 Seafood Species",
+       x = "Calendar year",
+       y = "Rank",
+       colour = "Species") +
+  theme_minimal(base_size = 11) +
+  theme(legend.position = "right")
+
+
+```
+
+
+
+# Further analysis
+##What is the correlation between seafood production and total trade volume
+
+```{r}
+# aggregate to annual totals
+annual_totals <- cleanseafood_data |>
+  filter(Commodity %in% c("Production", "Imports", "Exports")) |>
+  mutate(TradeFlag = if_else(Commodity == "Production", "Production", "Trade")) |>
+  group_by(CalendarYear, TradeFlag) |>
+  summarise(Total_tonne = sum(Volume_tonne, na.rm = TRUE), .groups = "drop") |>
+  pivot_wider(names_from = TradeFlag, values_from = Total_tonne)
+
+print(annual_totals)
+
+# correlation tests 
+pearson_res  <- cor.test(annual_totals$Production,
+                         annual_totals$Trade,
+                         method = "pearson")
+print(pearson_res)
+
+spearman_res <- cor.test(annual_totals$Production,
+                         annual_totals$Trade,
+                         method = "spearman")
+print(spearman_res)
+
+corr_tbl <- bind_rows(
+  tidy(pearson_res)  |> mutate(Method = "Pearson"),
+  tidy(spearman_res) |> mutate(Method = "Spearman")
+) |>
+  select(Method, estimate, p.value, conf.low, conf.high)
+
+print(corr_tbl)
+```
+
+
+
+```{r}
+
+#Pearson r for display
+r_val <- cor(annual_totals$Production, annual_totals$Trade, method = "pearson")
+
+# 2. Scatter + regression + annotation
+ggplot(annual_totals, aes(x = Production, y = Trade)) +
+  geom_point(size = 3, colour = "#4b9cd3") +
+  geom_smooth(method = "lm", se = TRUE, colour = "#4b9cd3", linewidth = 0.8) +
+  labs(
+    title    = "Correlation between UK Seafood Production and Trade (2009–2020)",
+    x        = "Production (tonnes)",
+    y        = "Trade (tonnes)"
+  ) +
+  theme_minimal(base_size = 12)
+
+```
+
+
+
+```{r}
+
+# annual totals
+annual_wide <- cleanseafood_data %>% 
+  filter(Commodity %in% c("Production", "Imports", "Exports")) %>% 
+  group_by(CalendarYear, Commodity) %>% 
+  summarise(Total_tonne = sum(Volume_tonne),
+            .groups = "drop") %>% 
+  pivot_wider(names_from  = Commodity,
+              values_from = Total_tonne) %>% 
+  arrange(CalendarYear)
+
+print(annual_wide)
+
+
+
+# Production vs Imports 
+r_imp <- cor(annual_wide$Production, annual_wide$Imports)
+
+ggplot(annual_wide,
+       aes(x = Production / 1e3, y = Imports / 1e3)) +
+  geom_point(size = 3, colour = "#4b9cd3") +
+  geom_smooth(method = "lm", se = TRUE, linewidth = 0.7, colour = "#4b9cd3") +
+  labs(title    = "Production vs Imports",
+       subtitle = "UK seafood, 2009–2020  |  volumes in thousand tonnes",
+       x = "Production (thousand t)",
+       y = "Imports (thousand t)") +
+  theme_minimal(base_size = 12)
+```
+
+
+```{r}
+# Production vs Exports 
+r_exp <- cor(annual_wide$Production, annual_wide$Exports)
+
+ggplot(annual_wide,
+       aes(x = Production / 1e3, y = Exports / 1e3)) +
+  geom_point(size = 3, colour = "#d95f02") +
+  geom_smooth(method = "lm", se = TRUE, linewidth = 0.7, colour = "#d95f02") +
+  labs(title    = "Production vs Exports",
+       subtitle = "UK seafood, 2009–2020  |  volumes in thousand tonnes",
+       x = "Production (thousand t)",
+       y = "Exports (thousand t)") +
+  theme_minimal(base_size = 12)
+```
+
+
+```{r}
+#Correlation heat-map for the three flows
+corr_mat  <- annual_wide %>%
+  select(Production, Imports, Exports) %>%
+  cor(use = "pairwise.complete.obs")
+
+corr_long <- corr_mat %>%
+  as_tibble(rownames = "Var1") %>%
+  pivot_longer(-Var1, names_to = "Var2", values_to = "r")
+
+# ensure the axes keep the original order
+corr_long <- corr_long %>%
+  mutate(Var1 = factor(Var1, levels = colnames(corr_mat)),
+         Var2 = factor(Var2, levels = colnames(corr_mat)))
+
+ggplot(corr_long, aes(x = Var1, y = Var2, fill = r)) +
+  geom_tile(colour = "white", linewidth = 0.4) +
+  geom_text(aes(label = sprintf("%.2f", r)), colour = "white", size = 4) +
+  labs(title = "Correlation Matrix: Production, Imports, Exports",
+       x = NULL, y = NULL) +
+  coord_fixed() +
+  theme_minimal(base_size = 12)
+
+
+
+```
+
+#forecasting
+
+```{r}
+
+# annual production ts
+production_data <- cleanseafood_data %>%
+  filter(Commodity == "Production") %>%
+  group_by(CalendarYear) %>%
+  summarise(Total = sum(Volume_tonne, na.rm=TRUE), .groups="drop")
+
+prod_ts <- ts(production_data$Total, start = min(production_data$CalendarYear), frequency = 1)
+
+# Fit ARIMA and forecast 5 years
+arima_model   <- auto.arima(prod_ts, stepwise=FALSE, approximation=FALSE)
+arima_fc      <- forecast(arima_model, h=5)
+
+
+# combined history + forecast dataframe
+forecast_df <- bind_rows(
+  production_data %>%
+    rename(year = CalendarYear) %>%
+    mutate(type = "history"),
+  
+  tibble(
+    year      = (max(production_data$CalendarYear) + 1):(max(production_data$CalendarYear) + 5),
+    Total     = as.numeric(arima_fc$mean),
+    lower     = as.numeric(arima_fc$lower[,2]),
+    upper     = as.numeric(arima_fc$upper[,2]),
+    type      = "forecast"
+  )
+) %>%
+  arrange(year)
+
+#continuous line connecting history + forecast
+ggplot(forecast_df, aes(x = year, y = Total, group = 1)) +
+  geom_line(size = 1, colour = "steelblue") +  
+  geom_point(aes(colour = type), size = 3) +
+  geom_ribbon(
+    data = filter(forecast_df, type == "forecast"),
+    aes(ymin = lower, ymax = upper),
+    fill = "cyan", alpha = 0.2
+  ) +
+  scale_colour_manual(values = c(history = "blue", forecast = "red")) +
+  labs(
+    title   = "UK Seafood Production Forecast (2021–2025) – ARIMA",
+    x       = "Year",
+    y       = "Production Volume (tonnes)",
+    colour  = ""
+  ) +
+  theme_bw(base_size = 12)
+
+```
+
+
+```{r}
+
+# annual production series
+production_data <- cleanseafood_data %>%
+  filter(Commodity == "Production") %>%
+  group_by(CalendarYear) %>%
+  summarise(Total = sum(Volume_tonne, na.rm = TRUE), .groups="drop")
+
+prod_ts <- ts(production_data$Total, 
+              start = min(production_data$CalendarYear), 
+              frequency = 1)
+
+#Holt's linear ETS (additive trend)
+ets_model <- ets(prod_ts, model = "AAN")
+ets_fc <- forecast(ets_model, h = 5)
+
+history_prod_df <- tibble(
+  Year  = time(prod_ts),
+  Value = as.numeric(prod_ts),
+  Type  = "history"
+)
+
+forecast_prod_df <- tibble(
+  Year  = as.integer(time(ets_fc$mean)),
+  Value = as.numeric(ets_fc$mean),
+  Lower = as.numeric(ets_fc$lower[,2]),
+  Upper = as.numeric(ets_fc$upper[,2]),
+  Type  = "forecast"
+)
+
+combined_prod <- bind_rows(history_prod_df, forecast_prod_df)
+
+ggplot(combined_prod, aes(x = Year, y = Value)) +
+  geom_line(colour = "steelblue", size = 1) +
+  geom_point(aes(colour = Type), size = 3) +
+  geom_ribbon(data = filter(combined_prod, Type == "forecast"),
+              aes(ymin = Lower, ymax = Upper),
+              fill = "cyan", alpha = 0.2) +
+  scale_colour_manual(values = c(history = "blue", forecast = "red")) +
+  labs(
+    title    = "UK Seafood Production Forecast (2021–2025)",
+    subtitle = "Holt’s Linear ETS",
+    x        = "Year",
+    y        = "Production (tonnes)"
+  ) +
+  theme_bw(base_size = 12)
+
+```
+
+```{r}
+
+#Compare AIC
+aic_vals <- data.frame(
+  Model = c("ARIMA", "ETS"),
+  AIC   = c(AIC(arima_model), AIC(ets_model))
+)
+print(aic_vals)
+
+#Compare accuracy
+acc_arima <- accuracy(arima_model)
+acc_ets   <- accuracy(ets_model)
+acc_df    <- data.frame(
+  Model = rep(c("ARIMA","ETS"), each=ncol(acc_arima)),
+  Metric= colnames(acc_arima),
+  ARIMA  = as.numeric(acc_arima[1,]),
+  ETS    = as.numeric(acc_ets[1,])
+)
+print(acc_df)
+
+fc_combined <- ts.union(
+  ARIMA = arima_fc$mean,
+  ETS   = ets_fc$mean
+)
+
+autoplot(prod_ts, series="Actual") +
+  autolayer(fc_combined, series=c("ARIMA","ETS")) +
+  labs(title="Production: Actual vs ARIMA & ETS Forecasts",
+       x="Year", y="Production (tonnes)") +
+  scale_colour_manual(values=c("Actual"="black","ARIMA"="grey50","ETS"="blue")) +
+  theme_minimal()
+
+```
+
+
+
+
+

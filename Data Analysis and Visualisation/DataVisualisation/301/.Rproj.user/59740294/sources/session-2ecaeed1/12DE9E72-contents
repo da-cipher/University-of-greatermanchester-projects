@@ -1,0 +1,502 @@
+---
+Name: Victor Ene
+Student_Number: 2318217
+module: DAT7303 Data Mining and Machine Learning
+Institute: University of Greater Manchester
+title: "Portfolio 3"
+output: html_document
+date: "2025-04-13"
+---
+
+```{r}
+# Installing Packages
+install.packages("tidyverse")
+install.packages("dplyr")
+install.packages("corrplot")
+install.packages("caret")
+install.packages("e1071")
+install.packages("keras")
+install.packages("randomForest")
+install.packages("reticulate")
+```
+
+```{r}
+# Load Libraries
+library(dplyr)
+library(corrplot)
+library(randomForest)
+library(ggplot2)
+library(Metrics)
+library(caret)
+library(e1071)
+library(rpart)
+library(keras)
+library(Metrics)
+library(reticulate)
+```
+
+```{r}
+# Setting working directories
+getwd()
+setwd("C:/Users/School/Documents/DataMining")
+```
+
+# DATA UNDERSTANDING
+
+```{r}
+# Load the data
+Housing <- read.csv("Housing Data_Same Region.csv")
+
+# check the structure of the data
+str(Housing)
+
+# Drop columns that are not needed
+HouseData <- Housing |> select(-LATITUDE, -LONGITUDE, -PARCELNO)
+
+```
+
+# DATA PREPARATION
+
+```{r}
+
+# Move Sale_prc to the last column
+HouseData <- HouseData |> select(-SALE_PRC, everything(), SALE_PRC)
+
+# Check to see the changes
+head(HouseData)
+
+# Check for missing data
+colSums(is.na(HouseData))
+```
+
+```{r}
+# DETECTING OUTLIERS
+
+# Detecting numeric columns
+numericCol <- sapply(HouseData, is.numeric)
+numericCol
+
+# Detect outliers using the IQR method
+outliers <- sapply(HouseData[, sapply(HouseData, is.numeric)], function(x) {
+  Q1 <- quantile(x, 0.25)
+  Q3 <- quantile(x, 0.75)
+  IQR <- Q3 - Q1
+  lower_bound <- Q1 - 1.5 * IQR
+  upper_bound <- Q3 + 1.5 * IQR
+  sum(x < lower_bound | x > upper_bound)  # Count the number of outliers
+})
+
+# Print the number of outliers for each numeric column
+print(outliers)
+
+# check to see the individua; columns
+HouseData_withFlags <- HouseData
+for(col in names(HouseData)) {
+  x <- HouseData[[col]]
+  Q1 <- quantile(x, 0.25, na.rm = TRUE)
+  Q3 <- quantile(x, 0.75, na.rm = TRUE)
+  IQR_val <- Q3 - Q1
+  lower_bound <- Q1 - 1.5 * IQR_val
+  upper_bound <- Q3 + 1.5 * IQR_val
+  flag <- ifelse(x < lower_bound | x > upper_bound, 1, 0)
+  HouseData_withFlags[[paste0(col, "_outlier")]] <- flag
+}
+head(HouseData_withFlags)
+```
+
+# Feature Engineering
+
+```{r}
+# Calculate the correlation matrix
+corMatrix <- cor(HouseData[, sapply(HouseData, is.numeric)])
+print(corMatrix)
+
+# Plot the correlation matrix
+corrplot(corMatrix, method = "color", type = "lower", order = "hclust", 
+         tl.cex = 0.8, # Text label size
+         number.cex = 0.6, # Number size in cells
+         col = colorRampPalette(c("blue", "white", "red"))(200))
+
+
+# Using rf model to check feature importance
+checkImp <- randomForest(SALE_PRC ~ ., data = HouseData, importance = TRUE)
+print(importance(checkImp))
+
+# Extract importance as a data frame
+imp_data <- as.data.frame(importance(checkImp))
+imp_data$Variable <- rownames(imp_data)  # Add variable names as a column
+
+# Plot %IncMSE using ggplot2
+ggplot(imp_data, aes(x = reorder(Variable, `%IncMSE`), y = `%IncMSE`)) +
+  geom_bar(stat = "identity", fill = "darkgreen") +
+  coord_flip() +  # Flip for horizontal bars
+  labs(title = "Variable Importance (%IncMSE) for SALE_PRC Prediction",
+       x = "Variables", y = "Increase in MSE (%)") +
+  theme_minimal()
+
+# Optionally, plot IncNodePurity
+ggplot(imp_data, aes(x = reorder(Variable, IncNodePurity), y = IncNodePurity)) +
+  geom_bar(stat = "identity", fill = "darkgreen") +
+  coord_flip() +
+  labs(title = "Variable Importance (IncNodePurity) for SALE_PRC Prediction",
+       x = "Variables", y = "Node Purity Increase") 
+
+# based on the %IncMSE and IncNodePurity avno60plus and month_sold are non-important
+
+#drop the non-important variables
+HouseData <- HouseData |> select(-avno60plus, -month_sold)
+head(HouseData)
+
+```
+
+```{r}
+# Visualise the distribution of SALE_PRC
+hist(HouseData$SALE_PRC, 
+     main = "Histogram of SALE_PRC", 
+     xlab = "SALE_PRC", 
+     col = "orange", 
+     border = "black", 
+     breaks = 20)
+
+# Create a copy of the dataset to store the scaled values
+HouseData_scale <- HouseData
+
+# Perform log transformation on the SALE_PRC column
+HouseData_scale$SALE_PRC <- log(HouseData_scale$SALE_PRC)
+
+hist(HouseData_scale$SALE_PRC,
+     breaks = 50,                      
+     main = "Histogram of Sale Price", 
+     xlab = "Sale Price",              
+     col = "orange",                  
+     border = "black")
+
+# scale the other vaariables to normalise data
+HouseData_norm <- preProcess(HouseData_scale[, -which(names(HouseData_scale) == "SALE_PRC")], method = "range")
+
+# Apply the normalisation model to the data (excluding SALE_PRC column)
+HouseData_scale[, -which(names(HouseData_scale) == "SALE_PRC")] <- predict(HouseData_norm, HouseData_scale[, -which(names(HouseData_scale) == "SALE_PRC")])
+View(HouseData_scale)
+```
+
+```{r}
+# splitting data into train and test set
+set.seed(123) #This ensures reproducibility. without this each run would give different random samples.
+trainSize <- sample(1:nrow(HouseData_scale), size = ceiling(0.8 * nrow(HouseData_scale)))
+
+trainSet <- HouseData_scale[trainSize, ]
+testSet <- HouseData_scale[-trainSize, ]
+head(trainSet)
+```
+
+# train a linear regression model
+
+```{r}
+lm_model <- lm(SALE_PRC ~ ., data = trainSet)
+
+# Save the trained model to a file
+saveRDS(lm_model, "lm_model.rds")
+
+# Make predictions on the test set
+lmPredict <- predict(lm_model, newdata = testSet)
+
+# check model performance
+lm_perform0 <- postResample(pred = lmPredict, obs = testSet$SALE_PRC)
+print(lm_perform)
+
+# save MAE to use for comparison
+LR_MAE <- mae(testSet$SALE_PRC, lmPredict)
+
+  
+#visualise the predicted vs actual values
+ggplot(data = data.frame(Actual = testSet$SALE_PRC, Predicted = lmPredict), aes(x = Actual, y = Predicted)) +
+  geom_point(color = 'blue') +
+  geom_abline(slope = 1, intercept = 0, color = 'red') +
+  xlab("Actual SALE_PRC") +
+  ylab("Predicted SALE_PRC") +
+  ggtitle("Linear Regression: Actual vs Predicted SALE_PRC")
+```
+
+# Train the SVR model
+
+```{r}
+# Train the SVR model for linear kernel to predict SALE_PRC
+  svrModel <- svm(SALE_PRC ~ ., data = trainSet, kernel = "linear")
+  svrLinPredict <- predict(svrModel, newdata = testSet)
+  
+  # Save the linear kernel SVR model
+  saveRDS(svrModel, "svr_linear_model.rds")
+  
+  #calculating the performance metrics
+  SVRPerform <- postResample(pred = svrLinPredict, obs = testSet$SALE_PRC)
+  
+  SVRLIN_MAE <- mae(testSet$SALE_PRC, svrLinPredict)
+  
+  
+  # Train the SVR model for poly kernel to predict SALE_PRC
+  svrModel2 <- svm(SALE_PRC ~ ., data = trainSet, kernel = "poly")
+  svrPolyPredict <- predict(svrModel2, newdata = testSet)
+  
+  # Save the polynomial kernel SVR model
+  saveRDS(svrModel2, "svr_poly_model.rds")
+
+  SVRPerform2 <- postResample(pred = svrPolyPredict, obs = testSet$SALE_PRC)
+  SVRPOLY_MAE <- mae(testSet$SALE_PRC, svrPolyPredict)
+
+
+```
+
+# Train a Decision tree model
+
+```{r}
+
+dtModel <- rpart(SALE_PRC ~ ., data = trainSet)
+dtPredict <- predict(dtModel, newdata = testSet)
+  
+# Save the Decision Tree model
+saveRDS(dtModel, "dt_model.rds")
+
+dtPerform <- postResample(pred = dtPredict, obs = testSet$SALE_PRC)
+DT_MAE <- mae(testSet$SALE_PRC, dtPredict)
+dtPerform
+DT_MAE
+```
+
+# Train a RandomForest Model
+
+```{r}
+# Train a RandomForest Model with ntree = 100
+rfModel100 <- randomForest(SALE_PRC ~ ., data = trainSet, ntree = 100)
+rfPredict100 <- predict(rfModel100, newdata = testSet)
+
+# Save the Random Forest model with ntree = 100
+saveRDS(rfModel100, "rf_model_100.rds")
+
+rfPerform100 <- postResample(pred = rfPredict100, obs = testSet$SALE_PRC)
+rfPerform100
+
+RF100_MAE <- mae(testSet$SALE_PRC, rfPredict100)
+RF100_MAE
+
+# Train a RandomForest Model with ntree = 200
+rfModel200 <- randomForest(SALE_PRC ~ ., data = trainSet, ntree = 200)
+rfPredict200 <- predict(rfModel200, newdata = testSet)
+rfPerform200 <- postResample(pred = rfPredict200, obs = testSet$SALE_PRC)
+rfPerform200
+RF200_MAE <- mae(testSet$SALE_PRC, rfPredict200)
+
+# Save the Random Forest model with ntree = 200
+saveRDS(rfModel200, "rf_model_200.rds")  
+  
+# Train a RandomForest Model with ntree = 500
+rfModel500 <- randomForest(SALE_PRC ~ ., data = trainSet, ntree = 500)
+rfPredict500 <- predict(rfModel500, newdata = testSet)
+rfPerform500 <- postResample(pred = rfPredict500, obs = testSet$SALE_PRC)
+print(rfPerform500)
+
+RF500_MAE <- mae(testSet$SALE_PRC, rfPredict500)
+
+rf_predictiontest <- predict(rfModel500, newdata = testSet)
+rf_predictiontest <- exp(rf_predictiontest)
+rf_predictiontest
+
+
+# Save the Random Forest model with ntree = 500
+saveRDS(rfModel500, "rf_model_500.rds")
+```
+
+# Train a KNN model
+
+```{r}
+
+knnModel <- caret::train(SALE_PRC ~ ., data = trainSet, method = "knn", tuneGrid = data.frame(k = 5))
+knnPredict <- predict(knnModel, testSet)
+knnPerform <- postResample(pred = knnPredict, obs = testSet$SALE_PRC)
+print(knnPerform)
+KNN_MAE <- mae(testSet$SALE_PRC, knnPredict)
+
+# Save the trained KNN model
+saveRDS(knnModel, "knn_model.rds")
+  
+```
+
+```{r}
+reticulate::virtualenv_create("C:/Users/School/AppData/Local/myenv", python ="C:/Users/School/AppData/Local/Programs/Python/Python310/python.exe")
+reticulate::use_virtualenv("C:/Users/School/AppData/Local/myenv", required = TRUE)
+install_keras()
+is_keras_available()
+```
+
+# Train a LSTM model
+
+```{r}
+  # Prepare data for LSTM
+  xTrain <- as.matrix(trainSet[, -which(names(trainSet) == "SALE_PRC")])
+  yTrain <- trainSet$SALE_PRC
+  xTest <- as.matrix(testSet[, -which(names(testSet) == "SALE_PRC")])
+  yTest <- testSet$SALE_PRC
+  
+  # Reshaping for LSTM input
+  xTrain <- array_reshape(xTrain, c(nrow(xTrain), 1, ncol(xTrain)))
+  xTest  <- array_reshape(xTest,  c(nrow(xTest),  1, ncol(xTest)))
+  
+  # Define the LSTM model
+  lstmModel <- keras_model_sequential() %>%
+    layer_lstm(units = 50, input_shape = c(1, dim(xTrain)[3]), return_sequences = FALSE) %>%
+    layer_dense(units = 1)
+  
+  # Compile the model
+  lstmModel %>% compile(
+    loss = 'mean_squared_error',
+    optimizer = optimizer_adam(),
+    metrics = c('mean_absolute_error')
+  )
+  
+  # Fit the model
+  lstmModel %>% fit(xTrain, yTrain, epochs = 10, batch_size = 32)
+  
+  # Make predictions
+  lstmPredict <- lstmModel %>% predict(xTest)
+  
+  # Evaluate the model
+  lstmPerform <- postResample(pred = lstmPredict, obs = testSet$SALE_PRC)
+  lstmPerform
+  LSTM_MAE <- mae(testSet$SALE_PRC, lstmPredict)
+  
+  # Save the LSTM model
+  save_model_hdf5(lstmModel, "lstm_model.h5")
+
+
+
+```
+
+```{r}
+#Visualising to determine the best model
+{
+  visual <- data.frame(
+  xaxis = c("LR", "SVR Linear", "SVR Poly", "DT", "RF 100", "RF 200", "RF 500", "KNN", "LSTM"),
+  yaxis = c(LR_MAE, SVRLIN_MAE, SVRPOLY_MAE, DT_MAE, RF100_MAE, RF200_MAE, RF500_MAE, KNN_MAE, LSTM_MAE)
+)
+ggplot(visual, aes(x = xaxis, y = yaxis)) + 
+  geom_bar(stat = "identity", fill = "orange") +  # Set bar color to orange
+  labs(title = "Model Performance Comparison", x = "Models", y = "Mean Absolute Error (MAE)") +  # Adding labels
+  theme_minimal() 
+}
+```
+
+```{r}
+
+# Load best Random Forest model
+best_rf_model <- readRDS("best_rf_model2.rds")
+
+# Prepare the new input data
+new_data <- data.frame(
+  LND_SQFOOT = 11247,
+  TOT_LVG_AREA = 4552,  
+  SPEC_FEAT_VAL = 2105,
+  RAIL_DIST = 4871.9,
+  OCEAN_DIST = 18507.2,
+  WATER_DIST = 375.8,
+  CNTR_DIST = 43897.9,
+  SUBCNTR_DI = 40115.7,
+  HWY_DIST = 41917.1,
+  age = 42,
+  avno60plus = 0,
+  structure_quality = 5,
+  month_sold = 8
+)
+
+# Make predictions using the optimal model
+rf_prediction <- predict(best_rf_model, newdata = new_data)
+
+cat("Predicted SALE_PRC:", rf_prediction, "\n")
+
+```
+
+```{r}
+
+# read the data
+Housing2 <- read.csv("Housing Data_Same Region.csv")
+HouseData2 <- Housing |> select(-LATITUDE, -LONGITUDE, -PARCELNO)
+
+HouseData2 <- HouseData2 |> select(-SALE_PRC, everything(), SALE_PRC)
+HouseData2 <- HouseData2[, sapply(HouseData2, is.numeric)]
+
+# Create a preprocessing object for normalization (range: 0 to 1)
+# Preprocess only the numeric columns
+normal <- preProcess(HouseData2[, -which(names(HouseData2) == "SALE_PRC")], method = "range")
+
+# Apply the normalization model to the numeric data (excluding SALE_PRC column)
+HouseData2[, -which(names(HouseData2) == "SALE_PRC")] <- predict(normal, HouseData2[, -which(names(HouseData2) == "SALE_PRC")])
+
+set.seed(123) 
+trainSize2 <- sample(1:nrow(HouseData2), size = ceiling(0.8 * nrow(HouseData2)))
+
+trainSet2 <- HouseData2[trainSize, ]
+testSet2 <- HouseData2[-trainSize, ]
+nrow(trainSet2)
+
+# Define the range for ntree (from 100 to 600 with a step of 1)
+ntree_values2 <- seq(100, 600, by = 1)
+
+# Define the tuning grid with mtry fixed at 3
+tuneGrid2 <- expand.grid(.mtry = 3)
+
+# Set up cross-validation settingsn
+trainControl2 <- trainControl(
+  method = "cv",      
+  number = 5,         
+  search = "grid"     
+)
+
+# Initialize list to store results and variables to track the best model
+results_list2 <- list()
+best_model2 <- NULL
+best_rmse2 <- Inf
+best_ntree2 <- NULL  # To track the best ntree value
+
+# Loop through each ntree value and train the model, printing progress to the console
+for(i in seq_along(ntree_values2)) {
+  current_ntree2 <- ntree_values2[i]
+  cat("Iteration", i, "of", length(ntree_values2), "- ntree =", current_ntree2, "\n")
+  
+  # Train the Random Forest model with the current ntree value and fixed mtry = 3
+  rf_model2 <- train(
+    SALE_PRC ~ .,             # Use SALE_PRC as the target
+    data = trainSet2,              # Training data
+    method = "rf",                # Random Forest method
+    trControl = trainControl2,     # Cross-validation settings
+    tuneGrid = tuneGrid2,          # Hyperparameter grid (fixed mtry)
+    ntree = current_ntree2,        # Set number of trees for this iteration
+    importance = TRUE             # Track feature importance
+  )
+  
+  # Store the model corresponding to the current ntree value
+  results_list[[as.character(current_ntree2)]] <- rf_model2
+  
+  # Find the best RMSE from this model's cross-validation results
+  current_rmse2 <- min(rf_model2$results$RMSE)
+  if(current_rmse2 < best_rmse2) {
+    best_rmse2 <- current_rmse2
+    best_model2 <- rf_model2
+    best_ntree2 <- current_ntree2  # Track the best ntree value
+  }
+}
+
+# Save the best model
+saveRDS(best_model2, "best_rf_model2.rds")
+
+# Print the best ntree value
+cat("Best ntree value:", best_ntree2, "\n")  
+
+# Use the best model to make predictions on the sample data
+rf_predictions2 <- predict(best_model2, newdata = new_data)
+rf_predictions2
+
+cat("Predicted SALE_PRC:", rf_predictions2, "\n")
+# Evaluate performance on the test set 
+performance2 <- postResample(pred = rf_predictions2, obs = testSet2$SALE_PRC)
+cat("Performance on Test Set:", performance2, "\n")
+
+
+```

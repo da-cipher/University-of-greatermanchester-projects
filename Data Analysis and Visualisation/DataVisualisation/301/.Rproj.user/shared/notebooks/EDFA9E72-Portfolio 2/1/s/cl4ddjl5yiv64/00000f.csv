@@ -1,0 +1,5 @@
+"0","# Identify rows with missing values in any column"
+"0","missing_rows <- seafood_data[rowSums(is.na(seafood_data)) > 0, ]"
+"0",""
+"0","# View the rows with missing values"
+"0","print(missing_rows)"
